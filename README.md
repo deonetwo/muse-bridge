@@ -26,9 +26,14 @@ egress.
 
 ## Features
 
-- **OpenAI-compatible** — `/v1/chat/completions` (streaming via SSE),
-  `/v1/models`; works with the official OpenAI SDKs by overriding `base_url`.
-- **Image generation & serving** — ask for an image, get a public markdown URL.
+- **OpenAI-compatible** — `/v1/chat/completions` (progressive streaming via
+  SSE), `/v1/models`; works with the official OpenAI SDKs by overriding
+  `base_url`.
+- **Image generation & serving** — ask for an image, get a signed markdown URL.
+- **File generation & serving** — ask for a file (code, doc, etc.), get a
+  signed download URL.
+- **Signed URLs** — image/file URLs carry HMAC signatures with expiry;
+  unsigned URLs are rejected (anti-scraping).
 - **Role-based API keys** — one revocable key per app/instance; worker and user
   roles are strictly isolated.
 - **Resilient tunnel** — auto-reconnect with backoff plus a 25s ping keepalive.
@@ -45,15 +50,13 @@ egress.
 ├── PROMPT.md                  the mega-prompt: worker instructions + env +
 │                              systemd units + ops (everything to run it)
 ├── bridge.py                  HTTP server (Python stdlib only)
-├── worker/
-│   └── muse-bridge-do.js      Cloudflare Worker source (Durable Object)
-└── bin/
-    └── ws-tunnel.py           outbound WebSocket tunnel client (stdlib only)
+├── muse-bridge-do.js          Cloudflare Worker source (Durable Object)
+└── ws-tunnel.py               outbound WebSocket tunnel client (stdlib only)
 ```
 
 Runtime files created on the VPS (not in git): `bridge.env`,
 `ws-tunnel.env`, `*.service` units (embedded in PROMPT.md), `keys.json`,
-`queue/`, `images/`, client `.env` files.
+`queue/`, `images/`, `files/`, client `.env` files.
 
 ## Public API
 
@@ -63,8 +66,9 @@ Authentication: `Authorization: Bearer <api-key>` (except `/health`).
 | Endpoint | Auth | Notes |
 |---|---|---|
 | `GET /v1/models` | user | Returns `{"id": "muse", …}` |
-| `POST /v1/chat/completions` | user | `stream: true` supported (SSE, ends with `data: [DONE]`) |
-| `GET /v1/images/<id>[.png]` | user | PNG/JPG/WebP/GIF, path-traversal safe |
+| `POST /v1/chat/completions` | user | `stream: true` → progressive SSE chunks, ends with `data: [DONE]` |
+| `GET /v1/images/<id>[.ext]` | signed URL | PNG/JPG/WebP/GIF; requires `?expires=&sig=` |
+| `GET /v1/files/<id>[.ext]` | signed URL | txt/md/py/html/pdf/zip/…; requires `?expires=&sig=` |
 | `GET /health` | none | `{"ok": true}` |
 | `/muse/*` | — | **Not exposed** (Worker returns 404) |
 | `/tunnel` | WS secret | Tunnel endpoint for the VPS client only |
@@ -114,17 +118,28 @@ Each `--out` file contains `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`.
 - Base URL / API Key / Model: from the `.env` file (`muse`)
 - Context window: `128000` · Max output tokens: `8192` · Request timeout: `> 240s`
 
-## Images
+## Images & files (signed URLs)
 
 When the user asks for an image, the worker generates it, saves it as
-`images/<uuid>.png`, and replies with:
+`images/<uuid>.png`, requests a signed URL from the bridge, and replies with:
 
 ```markdown
-![description](https://muse.example.com/v1/images/<uuid>.png)
+![description](https://muse.example.com/v1/images/<uuid>.png?expires=...&sig=...)
 ```
 
-The image endpoint requires a user key (401 without), rejects path traversal,
-and sends `Cache-Control: public, max-age=86400`.
+When the user asks for a file, the worker saves it as `files/<uuid>.<ext>`
+and replies with:
+
+```markdown
+[filename.ext](https://muse.example.com/v1/files/<uuid>.ext?expires=...&sig=...)
+```
+
+**Security:** image/file URLs require a valid HMAC signature (`?expires=&sig=`).
+Unsigned or expired URLs return 403. Signatures are issued via the internal
+`POST /muse/sign_url` endpoint (worker role only) with a configurable TTL
+(default 1 hour, max 7 days). The signing secret (`BRIDGE_URL_SECRET`) lives
+in `bridge.env` (mode 600) and never leaves the server. UUIDs remain
+unguessable as a second layer; there is no directory listing.
 
 ## Deploying the Cloudflare Worker
 
@@ -133,7 +148,7 @@ account, plus the tunnel secret.
 
 ```bash
 ACCT=<account-id>  SECRET=$(cat ~/.cloudflared/.tunnel-secret)
-sed "s/REPLACE_TUNNEL_SECRET/$SECRET/" worker/muse-bridge-do.js > /tmp/w.js
+sed "s/REPLACE_TUNNEL_SECRET/$SECRET/" muse-bridge-do.js > /tmp/w.js
 
 # multipart upload with Durable Object binding (SQLite class, free-plan OK)
 python3 - <<'EOF'
@@ -181,13 +196,21 @@ curl -s https://muse.example.com/health  # full public chain
 
 ## Known limitations
 
-- Answers take ~10–20s (1-minute worker poll + queue).
+- Answers take ~10–20s (1-minute worker poll + queue). Streaming delivers
+  text progressively once generation starts, but time-to-first-token is
+  unchanged.
 - OpenAI `tools`/`tool_calls` (function calling) is **not** implemented —
-  agentic IDE modes won't work; chat, streaming, and images do.
+  agentic IDE modes won't work; chat, streaming, images, and files do.
 - The WS tunnel can drop during long idle periods; the client auto-reconnects.
 
 ## Changelog
 
+- **2026-10-08** — Signed URLs for `/v1/images/*` and `/v1/files/*`
+  (`?expires=&sig=`, via `POST /muse/sign_url`); unsigned URLs → 403.
+- **2026-10-08** — Added `/v1/files/*` for general file delivery
+  (code, docs, archives) with MIME-type handling.
+- **2026-10-07** — Progressive streaming: `/muse/answer_chunk` for real-time
+  SSE deltas; bridge falls back to sentence-by-sentence delivery.
 - **2026-10-07** — Rebuilt in DIRECT mode (no 9Router/Hermes). Replaced
   `cloudflared` (broken by egress TLS interception) with Worker + WebSocket.
 - **2026-10-07** — Added `/v1/images/*`; worker is now general-purpose

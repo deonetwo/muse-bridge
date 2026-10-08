@@ -42,6 +42,7 @@ BRIDGE_TAILSCALE=0
 BRIDGE_PUBLIC_URL=https://muse.example.com/v1
 BRIDGE_QUEUE=/home/user/muse-bridge/queue
 BRIDGE_KEYS=/home/user/muse-bridge/keys.json
+BRIDGE_URL_SECRET=<32-byte-urlsafe-secret>  # HMAC for signed file/image URLs
 # file: /home/user/muse-bridge/bridge.env (600)
 
 # --- tunnel client ---
@@ -65,8 +66,10 @@ BRIDGE_TAILSCALE=0
 BRIDGE_PUBLIC_URL=https://muse.example.com/v1
 BRIDGE_QUEUE=/home/user/muse-bridge/queue
 BRIDGE_KEYS=/home/user/muse-bridge/keys.json
+BRIDGE_URL_SECRET=<output-of: python3 -c "import secrets; print(secrets.token_urlsafe(32))">
 # optional: BRIDGE_TOKEN=legacy-shared-token (counts as user role on /v1/*)
 # optional: BRIDGE_WAIT_SECS=240 BRIDGE_MAX_PENDING=5 BRIDGE_LEASE_SECS=180
+# optional: BRIDGE_URL_TTL=3600 (default signed-URL lifetime in seconds)
 ```
 
 ### ws-tunnel.env (mode 600)
@@ -162,12 +165,31 @@ python3 ~/muse-bridge/bridge.py keydel <label|prefix>
    - Use tools and knowledge as needed.
 5. If the user asks for an **image**: generate it, save as
    `/home/user/muse-bridge/images/<uuid>.png` (uuid without dashes,
-   alphanumeric only), and include in your answer:
-   `![description](https://muse.example.com/v1/images/<uuid>.png)`.
+   alphanumeric only). Then get a signed URL:
+   `POST http://127.0.0.1:8765/muse/sign_url`
+   `{"path": "/v1/images/<uuid>.png", "ttl": 86400}` with the worker key.
+   Include in your answer: `![description](<signed-url>)`.
    Never refuse with "text-only" — image delivery is supported.
-6. `POST http://127.0.0.1:8765/muse/answer`
+   NEVER write a raw `/v1/images/...` URL without `?expires=&sig=` —
+   unsigned URLs return 403.
+6. If the user asks for a **file** (code, document, etc.): create it, save as
+   `/home/user/muse-bridge/files/<uuid>.<ext>` (uuid without dashes).
+   Then get a signed URL:
+   `POST http://127.0.0.1:8765/muse/sign_url`
+   `{"path": "/v1/files/<uuid>.<ext>", "ttl": 86400}` with the worker key.
+   Include in your answer: `[filename.ext](<signed-url>)`.
+   NEVER write a raw `/v1/files/...` URL without signature — it returns 403.
+7. **Streaming** (when `job.request.stream == true`): POST partial text as
+   you generate it —
+   `POST http://127.0.0.1:8765/muse/answer_chunk`
+   `{"id": "<job.id>", "delta": "<1-2 sentences>"}` with the worker key,
+   per 1–2 sentences. Do NOT wait for the full answer.
+   After all chunks, POST the COMPLETE answer (identical to the joined
+   chunks) to `/muse/answer`. If `stream` is not true, skip chunking.
+8. `POST http://127.0.0.1:8765/muse/answer`
    `{"id": "<job.id>", "content": "<answer>"}` with the worker key.
-7. Stay silent on success. Escalate only on: bridge unreachable, 401,
+   (For streaming jobs, this is the final step after chunking.)
+9. Stay silent on success. Escalate only on: bridge unreachable, 401,
    or repeated blocking errors.
 
 ## PART 5 — VM quirks (critical)
